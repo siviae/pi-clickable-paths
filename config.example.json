@@ -1,0 +1,6 @@
+{
+  "extensionOpeners": {
+    "md, txt, json, ts, js": "vscode",
+    "xlsx, xls, ods": "system"
+  }
+}

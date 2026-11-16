@@ -1,123 +1,110 @@
-/**
- * clickable-paths — makes file paths in the transcript clickable.
- *
- * The harness says "your file is in C:\...\foo.ts" and you want to click it.
- * This registers a Markdown transformer (display-only: never touches model
- * context) that rewrites paths that EXIST on disk into markdown links. Pi's
- * Markdown component renders those as OSC 8 hyperlinks, so the terminal
- * handles the click natively: Ctrl+click opens the file with its default app
- * (folders open in Explorer).
- *
- * Safety rails:
- *  - fenced code blocks are left untouched
- *  - existing markdown links and inline code that is not a path are left as-is
- *  - only paths that resolve to something on disk become links
- *  - URLs (http/file/mailto) and drive roots (C:\) are skipped
- *
- * Works in terminals with OSC 8 support (Windows Terminal, VS Code, iTerm2,
- * Ghostty). No support + `terminal.hyperlinks: auto` → plain text, no harm.
- *
- * Zero deps. Reload with /reload after editing.
- */
-import * as fs from "node:fs";
-import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getCapabilities, type Component } from "@earendil-works/pi-tui";
+import { PathCache, findReference } from "./src/paths.ts";
+import { linkifyPaths, linkifyTerminal, type Options } from "./src/linkify.ts";
+import { DEFAULT_SETTINGS, loadSettings, type Settings } from "./src/config.ts";
+import { openerUrl } from "./src/opener.ts";
+import { fallbackCall, fallbackResult } from "./src/fallback-renderers.ts";
 
-// Existing markdown links: protect wholesale (their text/URL must not be re-linked).
-const MD_LINK = /\[[^\]\n]*\]\([^)\n]+\)/g;
-// Inline code spans: candidate paths hide here (the agent usually backticks paths).
-const CODE_SPAN = /`([^`\n]+)`/g;
-// Plain candidates: Windows abs, POSIX abs (>=2 segments), or relative with extension.
-const PATH_RE =
-	/(?<![\w/:@~.\-])(?:[A-Za-z]:[\\/][^\s<>()\[\]{}"'`,;|*?!~=]+|\/(?:[\w@.%+-]+\/)+[\w@.%+-]+|(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z0-9]{1,8})/g;
-// Greedy char classes swallow sentence punctuation: split it off the link.
-const TRAILING = /[.,;:!?)\]}'"]+$/;
-const FENCE_LINE = /^\s*(`{3,}|~{3,})/;
+export { linkifyPaths, linkifyTerminal } from "./src/linkify.ts";
+export { toFileUrl } from "./src/paths.ts";
 
-export function toFileUrl(p: string): string {
-	const segs = p.replace(/\\/g, "/").split("/").filter(Boolean);
-	const drive = segs.length && /^[A-Za-z]:$/.test(segs[0]) ? segs.shift() : null;
-	return "file:///" + (drive ? drive + "/" : "") + segs.map(encodeURIComponent).join("/");
-}
+export default function clickablePaths(pi: ExtensionAPI, configPath = join(getAgentDir(), "pi-clickable-paths.json")) {
+  const cache = new PathCache();
+  let settings: Settings = DEFAULT_SETTINGS;
+  let cwd = process.cwd();
+  let active = false;
+  const toolFrames = new Map<string, unknown>();
+  const urlsIn = (rows: string[]) => [...new Set([...rows.slice(0, 12).join("\n").matchAll(/\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]+)(?:\x07|\x1b\\)/g)].map(m => m[1]))].slice(0, 4);
+  const options = (): Options => ({ cache,
+    target: (ref, meta) => openerUrl(ref, meta, settings) });
 
-/** "[core](file:///...)" when `raw` (a candidate) exists on disk, else null. */
-export function toClickable(raw: string, cwd: string): string | null {
-	const core = raw.replace(TRAILING, "");
-	if (core.length < 3) return null;
-	if (/^(https?|file|mailto|data):/i.test(core)) return null;
-	const win = /^[A-Za-z]:[\\/]/.test(core);
-	const posixAbs = core.startsWith("/");
-	if (!win && !posixAbs && !core.includes("/")) return null;
-	const bare = core.replace(/[\\/]+$/, "");
-	if (!bare || bare === "/" || /^[A-Za-z]:$/.test(bare)) return null; // drive roots, "/" alone
-	let target: string;
-	try {
-		target = win || posixAbs ? path.normalize(core) : path.resolve(cwd, core);
-	} catch {
-		return null;
-	}
-	try {
-		if (!fs.existsSync(target)) return null;
-	} catch {
-		return null;
-	}
-	return `[${core}](${toFileUrl(target)})`;
-}
+  pi.on("session_start", async (_event, ctx) => {
+    cwd = ctx.cwd;
+    cache.clear();
+    toolFrames.clear();
+    try { settings = loadSettings(configPath); }
+    catch (error) {
+      settings = DEFAULT_SETTINGS;
+      if (ctx.hasUI) ctx.ui.notify(`clickable-paths: ${configPath}: ${String(error)}. Using defaults.`, "error");
+    }
+    active = ctx.mode === "tui";
+  });
+  pi.on("before_agent_start", (_event, ctx) => { cwd = ctx.cwd; });
+  pi.on("session_shutdown", () => { active = false; cache.clear(); toolFrames.clear(); });
+  pi.registerCommand("clickable-paths-debug", {
+    description: "Show active opener settings and the URLs emitted by recent tool renders",
+    handler: async (args, ctx) => {
+      const found = args.trim() ? findReference(args.trim(), ctx.cwd, cache) : null;
+      const report = {
+        configPath, mode: ctx.mode, active, hyperlinks: getCapabilities().hyperlinks,
+        settings, requestedPath: args.trim() || undefined,
+        requestedUrl: found ? openerUrl(found.ref, found.meta, settings) : undefined,
+        recentToolFrames: [...toolFrames.values()],
+      };
+      const message = JSON.stringify(report, null, 2);
+      if (ctx.hasUI) ctx.ui.notify(message, "info");
+      else console.log(message);
+    },
+  });
+  pi.registerMarkdownTransformer((markdown, ctx) => {
+    // Don't do synchronous filesystem I/O for every streamed token or thinking update.
+    if (!active || ctx.isStreaming || ctx.messageType === "assistant-thinking") return markdown;
+    return linkifyPaths(markdown, cwd, options());
+  });
 
-function linkifyLine(line: string, cwd: string): string {
-	const regions: { start: number; end: number; text: string }[] = [];
-	const overlaps = (s: number, e: number) => regions.some((r) => s < r.end && e > r.start);
-	for (const m of line.matchAll(MD_LINK)) regions.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
-	for (const m of line.matchAll(CODE_SPAN)) {
-		const s = m.index, e = s + m[0].length;
-		if (overlaps(s, e)) continue;
-		const link = toClickable(m[1].trim(), cwd);
-		regions.push({ start: s, end: e, text: link ?? m[0] });
-	}
-	for (const m of line.matchAll(PATH_RE)) {
-		const core = m[0].replace(TRAILING, "");
-		const s = m.index, e = s + core.length;
-		if (e <= s || overlaps(s, e)) continue;
-		const link = toClickable(core, cwd);
-		if (link) regions.push({ start: s, end: e, text: link });
-	}
-	if (!regions.length) return line;
-	regions.sort((a, b) => a.start - b.start);
-	let out = "", pos = 0;
-	for (const r of regions) {
-		if (r.start < pos) continue;
-		out += line.slice(pos, r.start) + r.text;
-		pos = r.end;
-	}
-	return out + line.slice(pos);
-}
-
-/** Linkify paths outside fenced code blocks. */
-export function linkifyPaths(md: string, cwd: string): string {
-	if (!md.includes("\\") && !md.includes("/") && !md.includes("`")) return md;
-	let inFence = false;
-	let fence = "";
-	return md
-		.split("\n")
-		.map((line) => {
-			const f = line.match(FENCE_LINE);
-			if (f) {
-				if (!inFence) {
-					inFence = true;
-					fence = f[1];
-				} else if (f[1][0] === fence[0] && f[1].length >= fence.length) {
-					inFence = false;
-				}
-				return line;
-			}
-			return inFence ? line : linkifyLine(line, cwd);
-		})
-		.join("\n");
-}
-
-export default function (pi: ExtensionAPI) {
-	const cwd = process.cwd();
-	pi.registerMarkdownTransformer((markdown, ctx) =>
-		ctx.messageType === "user" || ctx.messageType === "assistant" ? linkifyPaths(markdown, cwd) : markdown,
-	);
+  // Wrap other renderers, rather than replacing tools or touching their results.
+  // Delegating through next() preserves built-in and other extensions' layouts.
+  const unwrapped = new WeakMap<Component, Component>();
+  const wrap = (component: Component, renderCwd: string, partial: boolean, name: string, slot: string): Component => {
+    const proxy = new Proxy(component, {
+      get(target, prop) {
+        if (prop === "render") return (width: number) => {
+          const rows = target.render(width);
+          const hyperlinks = getCapabilities().hyperlinks;
+          const enabled = active && !partial && settings.toolLinks && hyperlinks;
+          const opts = { ...options(), budget: { remaining: 128 } };
+          const output = enabled ? rows.map(row => linkifyTerminal(row, renderCwd, opts)) : rows;
+          const key = `${name}/${slot}`;
+          toolFrames.delete(key);
+          toolFrames.set(key, { name, slot, cwd: renderCwd, active, partial, toolLinks: settings.toolLinks, hyperlinks, before: urlsIn(rows), after: urlsIn(output) });
+          while (toolFrames.size > 10) toolFrames.delete(toolFrames.keys().next().value!);
+          return output;
+        };
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+      set(target, prop, value) { return Reflect.set(target, prop, value, target); },
+    });
+    unwrapped.set(proxy, component);
+    return proxy;
+  };
+  pi.registerToolRenderer((name, next) => {
+    const base = next();
+    return {
+      ...base,
+      // Always provide both slots: otherwise Pi's generic fallback is drawn
+      // outside this extension and path matching never sees it.
+      renderCall: (args, theme, ctx) => {
+        const lastComponent = ctx.lastComponent && (unwrapped.get(ctx.lastComponent) ?? ctx.lastComponent);
+        let child: Component | undefined;
+        try { child = base?.renderCall?.(args, theme, { ...ctx, lastComponent }); }
+        catch { /* Like Pi, fall back when a custom renderer fails. */ }
+        child ??= fallbackCall(name, args, theme, ctx.expanded);
+        // Some live tool lifecycles leave argsComplete false even after the
+        // result is final. It cannot gate header linking. Inspect the currently
+        // rendered header with the same bounded filesystem cache instead.
+        return wrap(child, ctx.cwd, false, name, "call");
+      },
+      renderResult: (result, opts, theme, ctx) => {
+        const lastComponent = ctx.lastComponent && (unwrapped.get(ctx.lastComponent) ?? ctx.lastComponent);
+        let child: Component | undefined;
+        try { child = base?.renderResult?.(result, opts, theme, { ...ctx, lastComponent }); }
+        catch { /* Keep the fallback inside the same linking pipeline. */ }
+        child ??= fallbackResult(result, opts.expanded, ctx.showImages, theme, ctx.keyHint);
+        return wrap(child, ctx.cwd, opts.isPartial, name, "result");
+      },
+    };
+  });
 }

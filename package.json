@@ -1,0 +1,26 @@
+{
+  "name": "pi-clickable-paths",
+  "version": "0.3.0",
+  "description": "Clickable local paths in Pi with direct editor links and system-app fallback",
+  "type": "module",
+  "license": "MIT",
+  "repository": "https://github.com/siviae/pi-clickable-paths",
+  "keywords": ["pi-package"],
+  "files": ["index.ts", "src", "config.example.json", "README.md", "LICENSE"],
+  "pi": { "extensions": ["./index.ts"] },
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "check": "tsc --noEmit && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.5.0",
+    "@earendil-works/pi-tui": ">=1.5.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
